@@ -131,12 +131,10 @@ func main() {
 
 	// Clipboard handling for wayland (piping would be limited to 64k)
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
-		fmt.Fprintf(os.Stderr, "WAYLAND_DISPLAY detected. Attempting to use wl-copy with a temporary file.\n")
-
 		wlCopyPath, err := exec.LookPath("wl-copy")
 		if err != nil {
 			log.Printf("Wayland: 'wl-copy' command not found in PATH. Please ensure 'wl-clipboard' is installed.")
-			log.Printf("Falling back to default clipboard library method.")
+			log.Printf("Falling back to default clipboard library method. 64k limitation")
 			// Fallback to default library if wl-copy is not found
 			if errInit := clipboard.Init(); errInit != nil {
 				log.Fatalf("Fallback: Failed to initialize clipboard: %v", errInit)
@@ -183,7 +181,6 @@ func main() {
 		}
 	} else {
 		// Not Wayland, or fallback was not taken above, use the standard clipboard library
-		fmt.Fprintf(os.Stderr, "WAYLAND_DISPLAY not set or wl-copy not used. Using default clipboard library.\n")
 		err := clipboard.Init()
 		if err != nil {
 			log.Fatalf("Failed to initialize clipboard: %v", err)
@@ -191,11 +188,6 @@ func main() {
 		clipboard.Write(clipboard.FmtText, []byte(finalOutput))
 		fmt.Println("Content copied to clipboard!")
 	}
-
-	// For debugging, uncomment below:
-	// fmt.Println("\n---BEGIN CLIPBOARD CONTENT---")
-	// fmt.Println(finalOutput)
-	// fmt.Println("---END CLIPBOARD CONTENT---")
 }
 
 // processDirectory walks a directory and processes all files within it.
