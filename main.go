@@ -17,17 +17,25 @@ func main() {
 	// Define flags
 	promptPtr := flag.String("p", "", "A prompt to append after the main file contents")
 	followUpFilePtr := flag.String("f", "", "Path to a file whose content will be appended after the prompt, formatted as markdown")
+	outputFilePtr := flag.String("o", "", "Output to the specified file instead of clipboard")
+	stdoutPtr := flag.Bool("s", false, "Output to stdout instead of clipboard")
 
 	// Custom usage message
 	flag.Usage = func() {
 		progName := filepath.Base(os.Args[0])
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <path1> [path2 ...]\n", progName)
-		fmt.Fprintf(os.Stderr, "Processes files/directories, formats them as markdown, optionally appends a prompt and/or content from another file, and copies to clipboard.\n")
+		fmt.Fprintf(os.Stderr, "Processes files/directories, formats them as markdown, optionally appends a prompt and/or content from another file.\n")
+		fmt.Fprintf(os.Stderr, "Output is sent to clipboard by default, or to a file with -o, or to stdout with -s.\n")
 		fmt.Fprintf(os.Stderr, "\nArguments (Processed First):\n")
 		fmt.Fprintf(os.Stderr, "  <path1> [path2 ...]  Paths to files or directories to process.\n")
 		fmt.Fprintf(os.Stderr, "\nOptions (Appended in Order):\n")
 		flag.PrintDefaults() // Prints help for all defined flags
-		fmt.Fprintf(os.Stderr, "\nOrder of Output:\n")
+		fmt.Fprintf(os.Stderr, "\nOutput Destination (Mutually Exclusive):\n")
+		fmt.Fprintf(os.Stderr, "  -o <filepath>      Output to the specified file.\n")
+		fmt.Fprintf(os.Stderr, "  -s                 Output to stdout.\n")
+		fmt.Fprintf(os.Stderr, "  (default)          Output to clipboard.\n")
+		fmt.Fprintf(os.Stderr, "  Note: -o and -s are mutually exclusive. If neither is specified, output goes to clipboard.\n")
+		fmt.Fprintf(os.Stderr, "\nOrder of Output Content:\n")
 		fmt.Fprintf(os.Stderr, "  1. Content from <path1>, <path2>, ...\n")
 		fmt.Fprintf(os.Stderr, "  2. Text from -p \"prompt\"\n")
 		fmt.Fprintf(os.Stderr, "  3. Formatted content from -f <filepath>\n")
@@ -36,9 +44,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -p \"Review this code\" main.go\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -p \"Context:\" main.go -f context_details.txt\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -f instructions.md\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -o output.md main.go\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -s internal/ | less\n", progName)
 	}
 
 	flag.Parse() // Parse the command-line flags
+
+	// Check for mutually exclusive output options
+	if *stdoutPtr && *outputFilePtr != "" {
+		fmt.Fprintf(os.Stderr, "Error: -s (stdout) and -o (output file) options are mutually exclusive.\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	paths := flag.Args() // Get the non-flag arguments (paths)
 
@@ -124,111 +141,115 @@ func main() {
 	}
 
 	finalOutput := outputBuilder.String()
+
 	if strings.TrimSpace(finalOutput) == "" {
-		fmt.Println("No content processed or provided.")
-		return
+		fmt.Fprintln(os.Stderr, "Warning: Output is empty or contains only whitespace.")
+		// For clipboard, we will explicitly skip. For file/stdout, empty output will be written.
 	}
 
-	// Clipboard handling for wayland (piping would be limited to 64k)
-	if os.Getenv("WAYLAND_DISPLAY") != "" {
-		wlCopyPath, err := exec.LookPath("wl-copy")
+	// Output handling
+	if *stdoutPtr {
+		fmt.Print(finalOutput) // Print to stdout
+		fmt.Fprintln(os.Stderr, "Content written to stdout.")
+	} else if *outputFilePtr != "" {
+		filePath := *outputFilePtr
+		err := os.WriteFile(filePath, []byte(finalOutput), 0644)
 		if err != nil {
-			log.Printf("Wayland: 'wl-copy' command not found in PATH. Please ensure 'wl-clipboard' is installed.")
-			log.Printf("Falling back to default clipboard library method. 64k limitation")
-			// Fallback to default library if wl-copy is not found
-			if errInit := clipboard.Init(); errInit != nil {
-				log.Fatalf("Fallback: Failed to initialize clipboard: %v", errInit)
+			log.Fatalf("Failed to write to output file %s: %v", filePath, err)
+		}
+		fmt.Fprintf(os.Stderr, "Content written to file: %s\n", filePath)
+	} else {
+		// Clipboard output (default)
+		if strings.TrimSpace(finalOutput) == "" {
+			fmt.Fprintln(os.Stderr, "No content to copy to clipboard.")
+			return
+		}
+
+		if os.Getenv("WAYLAND_DISPLAY") != "" {
+			wlCopyPath, err := exec.LookPath("wl-copy")
+			if err != nil {
+				log.Printf("Wayland: 'wl-copy' command not found in PATH. Please ensure 'wl-clipboard' is installed.")
+				log.Printf("Falling back to default clipboard library method. Note potential 64k limitation.")
+				if errInit := clipboard.Init(); errInit != nil {
+					log.Fatalf("Fallback: Failed to initialize clipboard: %v", errInit)
+				}
+				clipboard.Write(clipboard.FmtText, []byte(finalOutput))
+				fmt.Fprintln(os.Stderr, "Content copied to clipboard using default library (wl-copy not found).")
+			} else {
+				tempFile, err := os.CreateTemp("", "fcopy-clipboard-*.txt")
+				if err != nil {
+					log.Fatalf("Wayland: Failed to create temp file: %v", err)
+				}
+				tempFilePath := tempFile.Name()
+				defer os.Remove(tempFilePath)
+
+				_, errWrite := tempFile.WriteString(finalOutput)
+				errClose := tempFile.Close()
+
+				if errWrite != nil {
+					log.Fatalf("Wayland: Failed to write to temp file %s: %v", tempFilePath, errWrite)
+				}
+				if errClose != nil {
+					log.Fatalf("Wayland: Failed to close temp file %s after writing: %v", tempFilePath, errClose)
+				}
+
+				fileForStdin, err := os.Open(tempFilePath)
+				if err != nil {
+					log.Fatalf("Wayland: Failed to open temp file %s for wl-copy stdin: %v", tempFilePath, err)
+				}
+				defer fileForStdin.Close()
+
+				cmd := exec.Command(wlCopyPath)
+				cmd.Stdin = fileForStdin
+				cmd.Stderr = os.Stderr
+
+				if err := cmd.Run(); err != nil {
+					log.Fatalf("Wayland: wl-copy command failed (command: %s, tempfile: %s): %v", wlCopyPath, tempFilePath, err)
+				}
+				fmt.Fprintln(os.Stderr, "Content copied to clipboard via wl-copy!")
+			}
+		} else {
+			if err := clipboard.Init(); err != nil {
+				log.Fatalf("Failed to initialize clipboard: %v", err)
 			}
 			clipboard.Write(clipboard.FmtText, []byte(finalOutput))
-			fmt.Println("Content copied to clipboard using default library (wl-copy not found).")
-		} else {
-			// wl-copy found, proceed with temp file method
-			tempFile, err := os.CreateTemp("", "fcopy-clipboard-*.txt")
-			if err != nil {
-				log.Fatalf("Wayland: Failed to create temp file: %v", err)
-			}
-			tempFilePath := tempFile.Name()
-			// Defer removal of the temp file. This runs when main() exits,
-			// unless log.Fatalf causes an earlier exit.
-			defer os.Remove(tempFilePath)
-
-			_, errWrite := tempFile.WriteString(finalOutput)
-			// Always close the file descriptor obtained from os.CreateTemp
-			errClose := tempFile.Close()
-
-			if errWrite != nil {
-				log.Fatalf("Wayland: Failed to write to temp file %s: %v", tempFilePath, errWrite)
-			}
-			if errClose != nil {
-				log.Fatalf("Wayland: Failed to close temp file %s after writing: %v", tempFilePath, errClose)
-			}
-
-			// Open the temp file for reading to pass to wl-copy's stdin
-			fileForStdin, err := os.Open(tempFilePath)
-			if err != nil {
-				log.Fatalf("Wayland: Failed to open temp file %s for wl-copy stdin: %v", tempFilePath, err)
-			}
-			defer fileForStdin.Close() // Close the reader for stdin
-
-			cmd := exec.Command(wlCopyPath)
-			cmd.Stdin = fileForStdin
-			cmd.Stderr = os.Stderr // Pipe wl-copy's errors to our stderr for visibility
-
-			if err := cmd.Run(); err != nil {
-				log.Fatalf("Wayland: wl-copy command failed (command: %s, tempfile: %s): %v", wlCopyPath, tempFilePath, err)
-			}
-			fmt.Println("Content copied to clipboard via wl-copy!")
+			fmt.Fprintln(os.Stderr, "Content copied to clipboard!")
 		}
-	} else {
-		// Not Wayland, or fallback was not taken above, use the standard clipboard library
-		err := clipboard.Init()
-		if err != nil {
-			log.Fatalf("Failed to initialize clipboard: %v", err)
-		}
-		clipboard.Write(clipboard.FmtText, []byte(finalOutput))
-		fmt.Println("Content copied to clipboard!")
 	}
 }
 
 // processDirectory walks a directory and processes all files within it.
-// absDirPath: absolute path to the directory to walk.
-// baseDisplayPath: the path argument as provided by the user (e.g., "internal/", "narun/caddynarun").
-// This is used to construct user-friendly display paths for files within the directory.
 func processDirectory(absDirPath string, baseDisplayPath string, builder *strings.Builder) {
 	fmt.Fprintf(os.Stderr, "Processing directory: %s\n", baseDisplayPath)
 	filepath.WalkDir(absDirPath, func(currentAbsPath string, d fs.DirEntry, errWalk error) error {
 		if errWalk != nil {
 			fmt.Fprintf(os.Stderr, "Error accessing %s: %v\n", currentAbsPath, errWalk)
-			if d == nil { // If d is nil, the error is likely fatal for this path.
+			if d == nil {
 				return errWalk
 			}
-			return nil // Otherwise, attempt to continue with other files/dirs.
+			return nil
 		}
 
 		if d.IsDir() {
-			if currentAbsPath == absDirPath { // Don't skip the root directory itself initially
+			if currentAbsPath == absDirPath {
 				return nil
 			}
-			// Skip hidden directories (e.g., .git, .vscode)
 			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
 				fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", currentAbsPath)
 				return filepath.SkipDir
 			}
-			return nil // Continue walking
+			return nil
 		}
 
-		// Skip hidden files (e.g., .DS_Store)
 		if strings.HasPrefix(d.Name(), ".") {
 			fmt.Fprintf(os.Stderr, "Skipping hidden file: %s\n", currentAbsPath)
 			return nil
 		}
 
-		// Construct the display path relative to the initially provided baseDisplayPath
 		relativePathInDir, err := filepath.Rel(absDirPath, currentAbsPath)
 		if err != nil {
-			// Fallback to absolute path if Rel fails (should be rare)
 			fmt.Fprintf(os.Stderr, "Error calculating relative path for %s (base %s): %v. Using absolute path for display.\n", currentAbsPath, absDirPath, err)
-			processFile(currentAbsPath, currentAbsPath, builder) // Use absolute path as display path
+			processFile(currentAbsPath, currentAbsPath, builder)
 			return nil
 		}
 
@@ -239,8 +260,6 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 }
 
 // processFile reads a file and appends its content formatted as a markdown code block to the builder.
-// absFilePath: absolute path to the file to read.
-// displayFilePath: the path to display in the markdown header (e.g., "internal/service.go").
 func processFile(absFilePath string, displayFilePath string, builder *strings.Builder) {
 	content, err := os.ReadFile(absFilePath)
 	if err != nil {
@@ -253,13 +272,10 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 		return
 	}
 
-	// Basic binary detection (null bytes)
 	isBinary := false
 	for i, b := range content {
 		if b == 0 {
-			// Allow a few null bytes at the beginning for UTF-16 BOM, etc.
-			// but if they appear later or frequently, it's likely binary.
-			if i < 10 && (len(content) > i+1 && content[i+1] == 0) { // simple check for wide chars
+			if i < 10 && (len(content) > i+1 && content[i+1] == 0) {
 				continue
 			}
 			isBinary = true
@@ -273,6 +289,10 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 
 	fmt.Fprintf(os.Stderr, "Adding file: %s\n", displayFilePath)
 
+	if builder.Len() > 0 { // Add a separator if there's existing content
+		builder.WriteString("\n\n") // Ensures a blank line before the new code block
+	}
+
 	lang := getLanguageHint(absFilePath)
 	header := displayFilePath
 	if lang != "" {
@@ -281,35 +301,37 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 
 	builder.WriteString(fmt.Sprintf("```%s\n", header))
 	builder.Write(content)
-	builder.WriteString("\n```\n\n") // Ensure two newlines after the code block for separation
+	// Ensure content ends with a newline before closing backticks if it doesn't already
+	if len(content) > 0 && content[len(content)-1] != '\n' {
+		builder.WriteByte('\n')
+	}
+	builder.WriteString("```\n") // Single newline after the closing backticks
 }
 
 // getLanguageHint determines a language hint from the file extension.
 func getLanguageHint(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
-	baseName := strings.ToLower(filepath.Base(filePath)) // For filename specific hints
+	baseName := strings.ToLower(filepath.Base(filePath))
 
-	// Check for specific filenames first
 	switch baseName {
 	case "caddyfile":
 		return "caddyfile"
-	case "dockerfile", "containerfile": // containerfile is another common name
+	case "dockerfile", "containerfile":
 		return "dockerfile"
 	case "makefile":
 		return "makefile"
 	}
 
-	// Then check extensions
 	switch ext {
 	case ".go":
 		return "go"
 	case ".md", ".markdown":
 		return "markdown"
-	case ".sh", ".bash": // .bash common for bash-specific scripts
+	case ".sh", ".bash":
 		return "bash"
 	case ".py":
 		return "python"
-	case ".js", ".mjs", ".cjs": // .mjs for ES Modules, .cjs for CommonJS
+	case ".js", ".mjs", ".cjs":
 		return "javascript"
 	case ".ts", ".tsx":
 		return "typescript"
@@ -317,7 +339,7 @@ func getLanguageHint(filePath string) string {
 		return "java"
 	case ".c", ".h":
 		return "c"
-	case ".cpp", ".cxx", ".hpp", ".hxx", ".cc", ".hh": // More C++ extensions
+	case ".cpp", ".cxx", ".hpp", ".hxx", ".cc", ".hh":
 		return "cpp"
 	case ".cs":
 		return "csharp"
@@ -327,7 +349,7 @@ func getLanguageHint(filePath string) string {
 		return "php"
 	case ".swift":
 		return "swift"
-	case ".kt", ".kts": // .kts for Kotlin Script
+	case ".kt", ".kts":
 		return "kotlin"
 	case ".rs":
 		return "rust"
@@ -343,14 +365,13 @@ func getLanguageHint(filePath string) string {
 		return "xml"
 	case ".sql":
 		return "sql"
-	case ".dockerfile": // Extension might also be used, though basename is more common
+	case ".dockerfile":
 		return "dockerfile"
 	case ".txt", ".text":
-		return "text" // Or "" for auto-detect by highlighter
-	case "": // No extension
-		return "" // No hint if no extension and not a known filename
+		return "text"
+	case "":
+		return ""
 	default:
-		// For unknown extensions, provide the extension itself as a hint (without the dot)
 		return strings.TrimPrefix(ext, ".")
 	}
 }
