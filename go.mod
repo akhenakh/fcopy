@@ -2,9 +2,7 @@ module github.com/akhenakh/fcopy
 
 go 1.24.2
 
-replace golang.design/x/clipboard => github.com/akhenakh/clipboard v0.0.0-20250508032009-974cbfcc4c57
-
-require golang.design/x/clipboard v0.0.0-00010101000000-000000000000
+require golang.design/x/clipboard v0.7.0
 
 require (
 	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
