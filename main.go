@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -19,6 +20,7 @@ func main() {
 	followUpFilePtr := flag.String("f", "", "Path to a file whose content will be appended after the prompt, formatted as markdown")
 	outputFilePtr := flag.String("o", "", "Output to the specified file instead of clipboard")
 	stdoutPtr := flag.Bool("s", false, "Output to stdout instead of clipboard")
+	termCopyPtr := flag.Bool("t", false, "Use terminal-aware clipboard (OSC 52, kitty), ideal for SSH") // New flag
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -33,8 +35,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nOutput Destination (Mutually Exclusive):\n")
 		fmt.Fprintf(os.Stderr, "  -o <filepath>      Output to the specified file.\n")
 		fmt.Fprintf(os.Stderr, "  -s                 Output to stdout.\n")
-		fmt.Fprintf(os.Stderr, "  (default)          Output to clipboard.\n")
-		fmt.Fprintf(os.Stderr, "  Note: -o and -s are mutually exclusive. If neither is specified, output goes to clipboard.\n")
+		fmt.Fprintf(os.Stderr, "  (default)          Output to clipboard. Use -t for better remote/SSH support.\n")
+		fmt.Fprintf(os.Stderr, "  Note: -o, -s, and clipboard output are mutually exclusive.\n")
 		fmt.Fprintf(os.Stderr, "\nOrder of Output Content:\n")
 		fmt.Fprintf(os.Stderr, "  1. Content from <path1>, <path2>, ...\n")
 		fmt.Fprintf(os.Stderr, "  2. Text from -p \"prompt\"\n")
@@ -42,8 +44,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s internal/ README.md\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -p \"Review this code\" main.go\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -p \"Context:\" main.go -f context_details.txt\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -f instructions.md\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -t -p \"Review this Go code over SSH\" main.go\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -o output.md main.go\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -s internal/ | less\n", progName)
 	}
@@ -144,7 +145,6 @@ func main() {
 
 	if strings.TrimSpace(finalOutput) == "" {
 		fmt.Fprintln(os.Stderr, "Warning: Output is empty or contains only whitespace.")
-		// For clipboard, we will explicitly skip. For file/stdout, empty output will be written.
 	}
 
 	// Output handling
@@ -160,62 +160,87 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Content written to file: %s\n", filePath)
 	} else {
 		// Clipboard output (default)
-		if strings.TrimSpace(finalOutput) == "" {
-			fmt.Fprintln(os.Stderr, "No content to copy to clipboard.")
+		copyToClipboard(finalOutput, *termCopyPtr)
+	}
+}
+
+// copyToClipboard handles the logic of copying text to the system clipboard
+// using various methods, prioritizing terminal-friendly ones if requested.
+func copyToClipboard(content string, useTermAware bool) {
+	if strings.TrimSpace(content) == "" {
+		fmt.Fprintln(os.Stderr, "No content to copy to clipboard.")
+		return
+	}
+
+	// Terminal-Aware Copy (OSC 52)
+	// This is the best method for remote sessions with compatible terminals (Kitty, etc.)
+	if useTermAware {
+		term := os.Getenv("TERM")
+		// Check for common terminal types that support OSC 52
+		if strings.Contains(term, "kitty") || strings.Contains(term, "xterm") || os.Getenv("TMUX") != "" {
+			fmt.Fprintln(os.Stderr, "Attempting clipboard copy via OSC 52 escape code...")
+			encodedContent := base64.StdEncoding.EncodeToString([]byte(content))
+			// OSC 52 format: \x1b]52;c;<base64-data>\x07
+			// The 'c' refers to the clipboard selection.
+			// Wrap in DCS for tmux compatibility: \x1bPtmux;\x1b\x1b]52;...
+			if os.Getenv("TMUX") != "" {
+				fmt.Printf("\x1bPtmux;\x1b\x1b]52;c;%s\x07\x1b\\", encodedContent)
+			} else {
+				fmt.Printf("\x1b]52;c;%s\x07", encodedContent)
+			}
+			fmt.Fprintln(os.Stderr, "Content sent to terminal for clipboard (OSC 52).")
 			return
 		}
+	}
 
-		if os.Getenv("WAYLAND_DISPLAY") != "" {
-			wlCopyPath, err := exec.LookPath("wl-copy")
-			if err != nil {
-				log.Printf("Wayland: 'wl-copy' command not found in PATH. Please ensure 'wl-clipboard' is installed.")
-				log.Printf("Falling back to default clipboard library method. Note potential 64k limitation.")
-				if errInit := clipboard.Init(); errInit != nil {
-					log.Fatalf("Fallback: Failed to initialize clipboard: %v", errInit)
-				}
-				clipboard.Write(clipboard.FmtText, []byte(finalOutput))
-				fmt.Fprintln(os.Stderr, "Content copied to clipboard using default library (wl-copy not found).")
-			} else {
-				tempFile, err := os.CreateTemp("", "fcopy-clipboard-*.txt")
-				if err != nil {
-					log.Fatalf("Wayland: Failed to create temp file: %v", err)
-				}
-				tempFilePath := tempFile.Name()
-				defer os.Remove(tempFilePath)
-
-				_, errWrite := tempFile.WriteString(finalOutput)
-				errClose := tempFile.Close()
-
-				if errWrite != nil {
-					log.Fatalf("Wayland: Failed to write to temp file %s: %v", tempFilePath, errWrite)
-				}
-				if errClose != nil {
-					log.Fatalf("Wayland: Failed to close temp file %s after writing: %v", tempFilePath, errClose)
-				}
-
-				fileForStdin, err := os.Open(tempFilePath)
-				if err != nil {
-					log.Fatalf("Wayland: Failed to open temp file %s for wl-copy stdin: %v", tempFilePath, err)
-				}
-				defer fileForStdin.Close()
-
-				cmd := exec.Command(wlCopyPath)
-				cmd.Stdin = fileForStdin
-				cmd.Stderr = os.Stderr
-
-				if err := cmd.Run(); err != nil {
-					log.Fatalf("Wayland: wl-copy command failed (command: %s, tempfile: %s): %v", wlCopyPath, tempFilePath, err)
-				}
-				fmt.Fprintln(os.Stderr, "Content copied to clipboard via wl-copy!")
+	// Kitty Kitten Clipboard (Very reliable if inside Kitty)
+	// This is a great fallback if OSC 52 is disabled for some reason.
+	if os.Getenv("KITTY_WINDOW_ID") != "" {
+		// First, check if the 'kitty' command is available in the PATH
+		kittyPath, err := exec.LookPath("kitty")
+		if err == nil {
+			fmt.Fprintln(os.Stderr, "Attempting clipboard copy via `kitty +kitten clipboard`...")
+			cmd := exec.Command(kittyPath, "+kitten", "clipboard")
+			cmd.Stdin = strings.NewReader(content)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err == nil {
+				fmt.Fprintln(os.Stderr, "Content copied to clipboard via `kitty +kitten clipboard`.")
+				return
 			}
-		} else {
-			if err := clipboard.Init(); err != nil {
-				log.Fatalf("Failed to initialize clipboard: %v", err)
-			}
-			clipboard.Write(clipboard.FmtText, []byte(finalOutput))
-			fmt.Fprintln(os.Stderr, "Content copied to clipboard!")
 		}
 	}
+
+	// External Command-Line Tools
+	// Search for common clipboard utilities.
+	tools := []string{"wl-copy", "xclip -selection clipboard", "xsel --clipboard"}
+	for _, tool := range tools {
+		parts := strings.Fields(tool)
+		path, err := exec.LookPath(parts[0])
+		if err != nil {
+			continue // Tool not found
+		}
+
+		fmt.Fprintf(os.Stderr, "Attempting clipboard copy via `%s`...\n", tool)
+		cmd := exec.Command(path, parts[1:]...)
+		cmd.Stdin = strings.NewReader(content)
+		cmd.Stderr = os.Stderr // Show errors from the tool
+
+		if err := cmd.Run(); err == nil {
+			fmt.Fprintf(os.Stderr, "Content copied to clipboard via `%s`.\n", tool)
+			return
+		} else {
+			fmt.Fprintf(os.Stderr, "Failed to copy with `%s`: %v\n", tool, err)
+		}
+	}
+
+	// Fallback to Go Library
+	// This often fails over SSH but is a good last resort for local desktop sessions.
+	fmt.Fprintln(os.Stderr, "Falling back to default clipboard library (may not work over SSH)...")
+	if err := clipboard.Init(); err != nil {
+		log.Fatalf("Failed to initialize clipboard library: %v\nPlease install xclip/xsel (for X11) or wl-clipboard (for Wayland), or use the -t flag with a modern terminal.", err)
+	}
+	clipboard.Write(clipboard.FmtText, []byte(content))
+	fmt.Fprintln(os.Stderr, "Content copied to clipboard!")
 }
 
 // processDirectory walks a directory and processes all files within it.
