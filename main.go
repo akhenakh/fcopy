@@ -145,6 +145,13 @@ func main() {
 
 	if strings.TrimSpace(finalOutput) == "" {
 		fmt.Fprintln(os.Stderr, "Warning: Output is empty or contains only whitespace.")
+	} else {
+		// Calculate and print the token estimate
+		charCount := len(finalOutput)
+		// A common heuristic: 1 token is roughly 4 characters.
+		// This is a very rough estimate but useful for LLM context windows.
+		tokenEstimate := charCount / 4
+		fmt.Fprintf(os.Stderr, "Estimated token count: ~%d (based on %d characters)\n", tokenEstimate, charCount)
 	}
 
 	// Output handling
