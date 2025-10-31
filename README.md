@@ -41,12 +41,34 @@ Your entire response MUST be formatted as valid Markdown.
 Use headings for major sections and bullet points for lists.
 If code examples are necessary, ensure they are in fenced code blocks with appropriate language tags.
 ```
-
 Now, when you want to copy some code and apply these rules:
 ```bash
 fcopy my_script.py -f ~/ai_rules/always_markdown.md
 ```
 The content of `my_script.py` will be copied, followed by the instructions from `always_markdown.md`. This ensures consistency and saves you from retyping common directives.
+
+## Using -x to Exclude Files and Directories
+
+The -x flag allows you to specify a comma-separated list of glob patterns to exclude from the output. This is useful for ignoring build artifacts, version control directories, logs, or any other files you don't want to include in the context.
+
+Common Patterns:
+
+    By name: -x .git,node_modules,dist
+
+    By extension: -x "*.log,*.tmp"
+
+    By path: -x "internal/testdata/*,docs/images"
+
+Example: Copy the entire project directory but exclude the .git folder, all markdown files, and the build directory.
+code Bash
+
+    
+```bash
+fcopy -x ".git,*.md,build" .
+```
+
+  
+
 
 ## Why `fcopy`?
 

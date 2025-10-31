@@ -10,9 +10,85 @@ import (
 	"os/exec" // Added for command execution
 	"path/filepath"
 	"strings"
+	"unicode" // Added for character classification
 
 	"golang.design/x/clipboard"
 )
+
+// isExcluded checks if a given path matches any of the glob patterns.
+func isExcluded(path string, excludePatterns []string) (bool, string) {
+	if len(excludePatterns) == 0 {
+		return false, ""
+	}
+	// Use ToSlash for consistent matching across OSes, as glob patterns use '/'
+	pathToCheck := filepath.ToSlash(path)
+
+	for _, pattern := range excludePatterns {
+		matched, err := filepath.Match(pattern, pathToCheck)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid exclude pattern '%s': %v\n", pattern, err)
+			continue
+		}
+		if matched {
+			return true, pattern
+		}
+	}
+	return false, ""
+}
+
+// estimateTokens provides a more detailed heuristic for token counting.
+// It classifies runes and applies different weights.
+func estimateTokens(content string) (int, string) {
+	if content == "" {
+		return 0, ""
+	}
+
+	var wordChars, spaceChars, symbolChars, otherChars int
+
+	for _, r := range content {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			wordChars++
+		} else if unicode.IsSpace(r) {
+			spaceChars++
+		} else if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			symbolChars++
+		} else {
+			otherChars++
+		}
+	}
+
+	// Heuristics refined based on real-world tokenizer (e.g., LLaMA) feedback.
+	// - Words: ~4 chars per token (standard English approximation). Remains a solid baseline.
+	wordTokens := wordChars / 4
+	// - Whitespace: Tokenizers are very efficient with whitespace (indentation, newlines).
+	//   Using a higher divisor to be more conservative.
+	spaceTokens := spaceChars / 5
+	// - Symbols: Many symbols are combined into single tokens (e.g., '->', ':=', '!=')
+	//   or merged with words. This ratio reflects that not every symbol is a new token.
+	symbolTokens := symbolChars * 2 / 3
+	// - Other: Penalize unknown/multi-byte chars as they likely become multiple tokens.
+	otherTokens := otherChars * 2
+
+	totalEstimate := wordTokens + spaceTokens + symbolTokens + otherTokens
+
+	details := fmt.Sprintf("~%d tokens (from %dk words, %dk whitespace, %dk symbols)",
+		totalEstimate,
+		(wordChars+500)/1000, // Round to nearest thousand
+		(spaceChars+500)/1000,
+		(symbolChars+500)/1000,
+	)
+	if otherChars > 0 {
+		details = fmt.Sprintf("~%d tokens (from %dk words, %dk whitespace, %dk symbols, %d other)",
+			totalEstimate,
+			(wordChars+500)/1000,
+			(spaceChars+500)/1000,
+			(symbolChars+500)/1000,
+			otherChars,
+		)
+	}
+
+	return totalEstimate, details
+}
 
 func main() {
 	// Define flags
@@ -20,7 +96,8 @@ func main() {
 	followUpFilePtr := flag.String("f", "", "Path to a file whose content will be appended after the prompt, formatted as markdown")
 	outputFilePtr := flag.String("o", "", "Output to the specified file instead of clipboard")
 	stdoutPtr := flag.Bool("s", false, "Output to stdout instead of clipboard")
-	termCopyPtr := flag.Bool("t", false, "Use terminal-aware clipboard (OSC 52, kitty), ideal for SSH") // New flag
+	termCopyPtr := flag.Bool("t", false, "Use terminal-aware clipboard (OSC 52, kitty), ideal for SSH")
+	excludePatternsPtr := flag.String("x", "", "Comma-separated list of glob patterns to exclude (e.g., '.git,*.log,dist/*')") // New flag
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -44,6 +121,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s internal/ README.md\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -p \"Review this code\" main.go\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -x \".git,*.md,build/\" .\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -t -p \"Review this Go code over SSH\" main.go\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -o output.md main.go\n", progName)
 		fmt.Fprintf(os.Stderr, "  %s -s internal/ | less\n", progName)
@@ -58,6 +136,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse exclude patterns
+	var excludePatterns []string
+	if *excludePatternsPtr != "" {
+		patterns := strings.Split(*excludePatternsPtr, ",")
+		for _, p := range patterns {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				excludePatterns = append(excludePatterns, trimmed)
+			}
+		}
+	}
+
 	paths := flag.Args() // Get the non-flag arguments (paths)
 
 	if len(paths) == 0 && *promptPtr == "" && *followUpFilePtr == "" {
@@ -69,6 +159,12 @@ func main() {
 
 	// 1. Process positional path arguments
 	for _, argPath := range paths {
+		// Pre-check if the argument itself is excluded
+		if excluded, pattern := isExcluded(filepath.ToSlash(filepath.Clean(argPath)), excludePatterns); excluded {
+			fmt.Fprintf(os.Stderr, "Skipping path %s (matches exclude pattern '%s')\n", argPath, pattern)
+			continue
+		}
+
 		absPath, err := filepath.Abs(argPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting absolute path for %s: %v\n", argPath, err)
@@ -93,7 +189,7 @@ func main() {
 		}
 
 		if info.IsDir() {
-			processDirectory(absPath, displayPathBase, &outputBuilder)
+			processDirectory(absPath, displayPathBase, &outputBuilder, excludePatterns)
 		} else {
 			processFile(absPath, displayPathBase, &outputBuilder)
 		}
@@ -146,12 +242,9 @@ func main() {
 	if strings.TrimSpace(finalOutput) == "" {
 		fmt.Fprintln(os.Stderr, "Warning: Output is empty or contains only whitespace.")
 	} else {
-		// Calculate and print the token estimate
-		charCount := len(finalOutput)
-		// A common heuristic: 1 token is roughly 4 characters.
-		// This is a very rough estimate but useful for LLM context windows.
-		tokenEstimate := charCount / 4
-		fmt.Fprintf(os.Stderr, "Estimated token count: ~%d (based on %d characters)\n", tokenEstimate, charCount)
+		// Calculate and print the elaborated token estimate
+		_, details := estimateTokens(finalOutput)
+		fmt.Fprintf(os.Stderr, "Estimated token count: %s\n", details)
 	}
 
 	// Output handling
@@ -251,7 +344,7 @@ func copyToClipboard(content string, useTermAware bool) {
 }
 
 // processDirectory walks a directory and processes all files within it.
-func processDirectory(absDirPath string, baseDisplayPath string, builder *strings.Builder) {
+func processDirectory(absDirPath string, baseDisplayPath string, builder *strings.Builder, excludePatterns []string) {
 	fmt.Fprintf(os.Stderr, "Processing directory: %s\n", baseDisplayPath)
 	filepath.WalkDir(absDirPath, func(currentAbsPath string, d fs.DirEntry, errWalk error) error {
 		if errWalk != nil {
@@ -262,30 +355,45 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 			return nil
 		}
 
-		if d.IsDir() {
-			if currentAbsPath == absDirPath {
-				return nil
-			}
-			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
-				fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", currentAbsPath)
+		// Don't process the root directory entry itself, just continue the walk.
+		if currentAbsPath == absDirPath {
+			return nil
+		}
+
+		// Calculate relative path for all subsequent checks
+		relativePath, err := filepath.Rel(absDirPath, currentAbsPath)
+		if err != nil {
+			// This should be rare, but handle it gracefully.
+			fmt.Fprintf(os.Stderr, "Error calculating relative path for %s (base %s): %v. Skipping.\n", currentAbsPath, absDirPath, err)
+			return nil
+		}
+
+		// 1. Check against user-defined exclude patterns
+		if excluded, pattern := isExcluded(relativePath, excludePatterns); excluded {
+			fmt.Fprintf(os.Stderr, "Skipping excluded path: %s (pattern: '%s')\n", relativePath, pattern)
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
+		// 2. Handle directories (check for hidden ones)
+		if d.IsDir() {
+			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
+				fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", relativePath)
+				return filepath.SkipDir
+			}
+			return nil // It's a valid directory to descend into, so continue walk.
+		}
+
+		// 3. Handle files (we are guaranteed it's a file at this point)
 		if strings.HasPrefix(d.Name(), ".") {
-			fmt.Fprintf(os.Stderr, "Skipping hidden file: %s\n", currentAbsPath)
+			fmt.Fprintf(os.Stderr, "Skipping hidden file: %s\n", relativePath)
 			return nil
 		}
 
-		relativePathInDir, err := filepath.Rel(absDirPath, currentAbsPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error calculating relative path for %s (base %s): %v. Using absolute path for display.\n", currentAbsPath, absDirPath, err)
-			processFile(currentAbsPath, currentAbsPath, builder)
-			return nil
-		}
-
-		displayFilePath := filepath.ToSlash(filepath.Join(baseDisplayPath, relativePathInDir))
+		// 4. Process the file
+		displayFilePath := filepath.ToSlash(filepath.Join(baseDisplayPath, relativePath))
 		processFile(currentAbsPath, displayFilePath, builder)
 		return nil
 	})
