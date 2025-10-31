@@ -21,6 +21,24 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
 
+      - name: Install X11 and Wayland dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            xorg-dev \
+            libxtst-dev \
+            libpng++-dev \
+            xcb \
+            libxcb-xkb-dev \
+            x11-xkb-utils \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
