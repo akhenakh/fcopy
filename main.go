@@ -7,10 +7,10 @@ import (
 	"io/fs"
 	"log"
 	"os"
-	"os/exec" // Added for command execution
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"unicode" // Added for character classification
+	"unicode"
 
 	"golang.design/x/clipboard"
 )
@@ -73,7 +73,7 @@ func estimateTokens(content string) (int, string) {
 
 	details := fmt.Sprintf("~%d tokens (from %dk words, %dk whitespace, %dk symbols)",
 		totalEstimate,
-		(wordChars+500)/1000, // Round to nearest thousand
+		(wordChars+500)/1000,
 		(spaceChars+500)/1000,
 		(symbolChars+500)/1000,
 	)
@@ -90,6 +90,28 @@ func estimateTokens(content string) (int, string) {
 	return totalEstimate, details
 }
 
+// getRepoName extracts a readable repository name from a URL to use as the base directory name.
+func getRepoName(url string) string {
+	// Simple heuristic: take the last part of the URL and strip .git
+	parts := strings.Split(strings.TrimRight(url, "/"), "/")
+	if len(parts) == 0 {
+		return "repo"
+	}
+	name := parts[len(parts)-1]
+	name = strings.TrimSuffix(name, ".git")
+	if name == "" {
+		return "repo"
+	}
+	return name
+}
+
+// target represents a file system location to process
+type target struct {
+	absPath     string
+	displayBase string
+	isDir       bool
+}
+
 func main() {
 	// Define flags
 	promptPtr := flag.String("p", "", "A prompt to append after the main file contents")
@@ -97,37 +119,25 @@ func main() {
 	outputFilePtr := flag.String("o", "", "Output to the specified file instead of clipboard")
 	stdoutPtr := flag.Bool("s", false, "Output to stdout instead of clipboard")
 	termCopyPtr := flag.Bool("t", false, "Use terminal-aware clipboard (OSC 52, kitty), ideal for SSH")
-	excludePatternsPtr := flag.String("x", "", "Comma-separated list of glob patterns to exclude (e.g., '.git,*.log,dist/*')") // New flag
+	excludePatternsPtr := flag.String("x", "", "Comma-separated list of glob patterns to exclude (e.g., '.git,*.log,dist/*')")
+	gitRepoPtr := flag.String("g", "", "Git repository URL to clone and process (shallow clone)") // New flag
 
 	// Custom usage message
 	flag.Usage = func() {
 		progName := filepath.Base(os.Args[0])
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <path1> [path2 ...]\n", progName)
-		fmt.Fprintf(os.Stderr, "Processes files/directories, formats them as markdown, optionally appends a prompt and/or content from another file.\n")
-		fmt.Fprintf(os.Stderr, "Output is sent to clipboard by default, or to a file with -o, or to stdout with -s.\n")
-		fmt.Fprintf(os.Stderr, "\nArguments (Processed First):\n")
+		fmt.Fprintf(os.Stderr, "Processes files, directories, or git repositories, formats them as markdown.\n")
+		fmt.Fprintf(os.Stderr, "\nArguments:\n")
 		fmt.Fprintf(os.Stderr, "  <path1> [path2 ...]  Paths to files or directories to process.\n")
-		fmt.Fprintf(os.Stderr, "\nOptions (Appended in Order):\n")
-		flag.PrintDefaults() // Prints help for all defined flags
-		fmt.Fprintf(os.Stderr, "\nOutput Destination (Mutually Exclusive):\n")
-		fmt.Fprintf(os.Stderr, "  -o <filepath>      Output to the specified file.\n")
-		fmt.Fprintf(os.Stderr, "  -s                 Output to stdout.\n")
-		fmt.Fprintf(os.Stderr, "  (default)          Output to clipboard. Use -t for better remote/SSH support.\n")
-		fmt.Fprintf(os.Stderr, "  Note: -o, -s, and clipboard output are mutually exclusive.\n")
-		fmt.Fprintf(os.Stderr, "\nOrder of Output Content:\n")
-		fmt.Fprintf(os.Stderr, "  1. Content from <path1>, <path2>, ...\n")
-		fmt.Fprintf(os.Stderr, "  2. Text from -p \"prompt\"\n")
-		fmt.Fprintf(os.Stderr, "  3. Formatted content from -f <filepath>\n")
+		fmt.Fprintf(os.Stderr, "\nOptions:\n")
+		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s internal/ README.md\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -p \"Review this code\" main.go\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -x \".git,*.md,build/\" .\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -t -p \"Review this Go code over SSH\" main.go\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -o output.md main.go\n", progName)
-		fmt.Fprintf(os.Stderr, "  %s -s internal/ | less\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -g https://github.com/user/repo\n", progName)
+		fmt.Fprintf(os.Stderr, "  %s -p \"Refactor this\" main.go\n", progName)
 	}
 
-	flag.Parse() // Parse the command-line flags
+	flag.Parse()
 
 	// Check for mutually exclusive output options
 	if *stdoutPtr && *outputFilePtr != "" {
@@ -148,23 +158,57 @@ func main() {
 		}
 	}
 
-	paths := flag.Args() // Get the non-flag arguments (paths)
+	argPaths := flag.Args()
 
-	if len(paths) == 0 && *promptPtr == "" && *followUpFilePtr == "" {
+	// Validate we have something to do
+	if len(argPaths) == 0 && *gitRepoPtr == "" && *promptPtr == "" && *followUpFilePtr == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	var outputBuilder strings.Builder
+	var targetsToProcess []target
 
-	// 1. Process positional path arguments
-	for _, argPath := range paths {
-		// Pre-check if the argument itself is excluded
-		if excluded, pattern := isExcluded(filepath.ToSlash(filepath.Clean(argPath)), excludePatterns); excluded {
-			fmt.Fprintf(os.Stderr, "Skipping path %s (matches exclude pattern '%s')\n", argPath, pattern)
-			continue
+	// Handle Git Repository if -g is provided
+	if *gitRepoPtr != "" {
+		// Check if git is installed
+		if _, err := exec.LookPath("git"); err != nil {
+			log.Fatal("Error: 'git' command not found in PATH. Required for -g flag.")
 		}
 
+		// Create temp directory
+		tempDir, err := os.MkdirTemp("", "fcopy-git-*")
+		if err != nil {
+			log.Fatalf("Error creating temporary directory: %v", err)
+		}
+		defer func() {
+			fmt.Fprintf(os.Stderr, "Cleaning up temp directory: %s\n", tempDir)
+			os.RemoveAll(tempDir)
+		}()
+
+		repoURL := *gitRepoPtr
+		fmt.Fprintf(os.Stderr, "Cloning %s into temporary directory...\n", repoURL)
+
+		// git clone --depth 1 <url> <tempDir>
+		cmd := exec.Command("git", "clone", "--depth", "1", repoURL, tempDir)
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Fatalf("Error cloning repository: %v", err)
+		}
+
+		// Add the temp dir to our targets list.
+		// We set displayBase to the repository name so paths look like "repo/main.go" instead of "/tmp/123/main.go"
+		repoName := getRepoName(repoURL)
+		targetsToProcess = append(targetsToProcess, target{
+			absPath:     tempDir,
+			displayBase: repoName,
+			isDir:       true,
+		})
+	}
+
+	// Handle standard positional arguments
+	for _, argPath := range argPaths {
 		absPath, err := filepath.Abs(argPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting absolute path for %s: %v\n", argPath, err)
@@ -173,39 +217,53 @@ func main() {
 
 		info, err := os.Stat(absPath)
 		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Fprintf(os.Stderr, "Path does not exist: %s\n", argPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "Error stating path %s: %v\n", argPath, err)
-			}
+			fmt.Fprintf(os.Stderr, "Error stating path %s: %v\n", argPath, err)
 			continue
 		}
 
-		var displayPathBase string
+		var displayBase string
 		if filepath.IsAbs(argPath) {
-			displayPathBase = filepath.Clean(argPath)
+			displayBase = filepath.Clean(argPath)
 		} else {
-			displayPathBase = argPath
+			displayBase = argPath
 		}
 
-		if info.IsDir() {
-			processDirectory(absPath, displayPathBase, &outputBuilder, excludePatterns)
+		targetsToProcess = append(targetsToProcess, target{
+			absPath:     absPath,
+			displayBase: displayBase,
+			isDir:       info.IsDir(),
+		})
+	}
+
+	// Process all targets (Git repo and/or local paths)
+	for _, t := range targetsToProcess {
+		// Pre-check exclude for the root path itself (mostly for local args)
+		// For git, we usually want to process the root temp dir, but individual files inside will be checked.
+		if !strings.HasPrefix(t.absPath, os.TempDir()) { // Don't exclude the temp dir itself
+			if excluded, pattern := isExcluded(filepath.ToSlash(filepath.Clean(t.displayBase)), excludePatterns); excluded {
+				fmt.Fprintf(os.Stderr, "Skipping path %s (matches exclude pattern '%s')\n", t.displayBase, pattern)
+				continue
+			}
+		}
+
+		if t.isDir {
+			processDirectory(t.absPath, t.displayBase, &outputBuilder, excludePatterns)
 		} else {
-			processFile(absPath, displayPathBase, &outputBuilder)
+			processFile(t.absPath, t.displayBase, &outputBuilder)
 		}
 	}
 
-	// 2. Append the prompt from -p if provided
+	// Append the prompt from -p if provided
 	promptText := *promptPtr
 	if promptText != "" {
 		if outputBuilder.Len() > 0 {
-			outputBuilder.WriteString("\n\n") // Two newlines for good separation
+			outputBuilder.WriteString("\n\n")
 		}
 		outputBuilder.WriteString(promptText)
 		fmt.Fprintf(os.Stderr, "Appended prompt text.\n")
 	}
 
-	// 3. Append content from the -f file if provided
+	// Append content from the -f file if provided
 	followUpFilePath := *followUpFilePtr
 	if followUpFilePath != "" {
 		absFollowUpPath, err := filepath.Abs(followUpFilePath)
@@ -214,11 +272,7 @@ func main() {
 		} else {
 			info, err := os.Stat(absFollowUpPath)
 			if err != nil {
-				if os.IsNotExist(err) {
-					fmt.Fprintf(os.Stderr, "Follow-up file -f %s does not exist.\n", followUpFilePath)
-				} else {
-					fmt.Fprintf(os.Stderr, "Error stating follow-up file -f %s: %v\n", followUpFilePath, err)
-				}
+				fmt.Fprintf(os.Stderr, "Error stating follow-up file -f %s: %v\n", followUpFilePath, err)
 			} else if info.IsDir() {
 				fmt.Fprintf(os.Stderr, "Error: Path for -f (%s) is a directory, must be a file.\n", followUpFilePath)
 			} else {
@@ -230,7 +284,7 @@ func main() {
 				}
 
 				if outputBuilder.Len() > 0 {
-					outputBuilder.WriteString("\n\n") // Separator
+					outputBuilder.WriteString("\n\n")
 				}
 				processFile(absFollowUpPath, displayFollowUpPath, &outputBuilder)
 			}
@@ -249,7 +303,7 @@ func main() {
 
 	// Output handling
 	if *stdoutPtr {
-		fmt.Print(finalOutput) // Print to stdout
+		fmt.Print(finalOutput)
 		fmt.Fprintln(os.Stderr, "Content written to stdout.")
 	} else if *outputFilePtr != "" {
 		filePath := *outputFilePtr
@@ -317,13 +371,13 @@ func copyToClipboard(content string, useTermAware bool) {
 		parts := strings.Fields(tool)
 		path, err := exec.LookPath(parts[0])
 		if err != nil {
-			continue // Tool not found
+			continue
 		}
 
 		fmt.Fprintf(os.Stderr, "Attempting clipboard copy via `%s`...\n", tool)
 		cmd := exec.Command(path, parts[1:]...)
 		cmd.Stdin = strings.NewReader(content)
-		cmd.Stderr = os.Stderr // Show errors from the tool
+		cmd.Stderr = os.Stderr
 
 		if err := cmd.Run(); err == nil {
 			fmt.Fprintf(os.Stderr, "Content copied to clipboard via `%s`.\n", tool)
@@ -337,7 +391,7 @@ func copyToClipboard(content string, useTermAware bool) {
 	// This often fails over SSH but is a good last resort for local desktop sessions.
 	fmt.Fprintln(os.Stderr, "Falling back to default clipboard library (may not work over SSH)...")
 	if err := clipboard.Init(); err != nil {
-		log.Fatalf("Failed to initialize clipboard library: %v\nPlease install xclip/xsel (for X11) or wl-clipboard (for Wayland), or use the -t flag with a modern terminal.", err)
+		log.Fatalf("Failed to initialize clipboard library: %v\nPlease install xclip/xsel or wl-clipboard, or use -t.", err)
 	}
 	clipboard.Write(clipboard.FmtText, []byte(content))
 	fmt.Fprintln(os.Stderr, "Content copied to clipboard!")
@@ -363,36 +417,41 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 		// Calculate relative path for all subsequent checks
 		relativePath, err := filepath.Rel(absDirPath, currentAbsPath)
 		if err != nil {
-			// This should be rare, but handle it gracefully.
-			fmt.Fprintf(os.Stderr, "Error calculating relative path for %s (base %s): %v. Skipping.\n", currentAbsPath, absDirPath, err)
+			fmt.Fprintf(os.Stderr, "Error calculating relative path: %v. Skipping.\n", err)
 			return nil
 		}
 
-		// 1. Check against user-defined exclude patterns
+		// Check against user-defined exclude patterns
 		if excluded, pattern := isExcluded(relativePath, excludePatterns); excluded {
-			fmt.Fprintf(os.Stderr, "Skipping excluded path: %s (pattern: '%s')\n", relativePath, pattern)
+			// Don't log exclusion of .git folder as it is very common
+			if d.Name() != ".git" {
+				fmt.Fprintf(os.Stderr, "Skipping excluded path: %s (pattern: '%s')\n", relativePath, pattern)
+			}
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// 2. Handle directories (check for hidden ones)
+		// Handle directories (check for hidden ones)
 		if d.IsDir() {
 			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
-				fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", relativePath)
+				// Don't log exclusion of .git folder
+				if d.Name() != ".git" {
+					fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", relativePath)
+				}
 				return filepath.SkipDir
 			}
-			return nil // It's a valid directory to descend into, so continue walk.
+			return nil
 		}
 
-		// 3. Handle files (we are guaranteed it's a file at this point)
+		// Handle files (we are guaranteed it's a file at this point)
 		if strings.HasPrefix(d.Name(), ".") {
 			fmt.Fprintf(os.Stderr, "Skipping hidden file: %s\n", relativePath)
 			return nil
 		}
 
-		// 4. Process the file
+		// Process the file
 		displayFilePath := filepath.ToSlash(filepath.Join(baseDisplayPath, relativePath))
 		processFile(currentAbsPath, displayFilePath, builder)
 		return nil
@@ -403,12 +462,12 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 func processFile(absFilePath string, displayFilePath string, builder *strings.Builder) {
 	content, err := os.ReadFile(absFilePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file %s (displaying as %s): %v\n", absFilePath, displayFilePath, err)
+		fmt.Fprintf(os.Stderr, "Error reading file %s: %v\n", displayFilePath, err)
 		return
 	}
 
-	if len(content) > 1*1024*1024 { // 1MB limit
-		fmt.Fprintf(os.Stderr, "Skipping large file ( > 1MB): %s\n", displayFilePath)
+	if len(content) > 1*1024*1024 {
+		fmt.Fprintf(os.Stderr, "Skipping large file (> 1MB): %s\n", displayFilePath)
 		return
 	}
 
@@ -423,14 +482,14 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 		}
 	}
 	if isBinary {
-		fmt.Fprintf(os.Stderr, "Skipping likely binary file (contains null bytes): %s\n", displayFilePath)
+		fmt.Fprintf(os.Stderr, "Skipping likely binary file: %s\n", displayFilePath)
 		return
 	}
 
 	fmt.Fprintf(os.Stderr, "Adding file: %s\n", displayFilePath)
 
-	if builder.Len() > 0 { // Add a separator if there's existing content
-		builder.WriteString("\n\n") // Ensures a blank line before the new code block
+	if builder.Len() > 0 {
+		builder.WriteString("\n\n")
 	}
 
 	lang := getLanguageHint(absFilePath)
@@ -445,7 +504,7 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 	if len(content) > 0 && content[len(content)-1] != '\n' {
 		builder.WriteByte('\n')
 	}
-	builder.WriteString("```\n") // Single newline after the closing backticks
+	builder.WriteString("```\n")
 }
 
 // getLanguageHint determines a language hint from the file extension.
@@ -509,8 +568,6 @@ func getLanguageHint(filePath string) string {
 		return "dockerfile"
 	case ".txt", ".text":
 		return "text"
-	case "":
-		return ""
 	default:
 		return strings.TrimPrefix(ext, ".")
 	}
