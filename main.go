@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/base64"
 	"flag"
 	"fmt"
@@ -20,24 +21,82 @@ func isExcluded(path string, excludePatterns []string) (bool, string) {
 	if len(excludePatterns) == 0 {
 		return false, ""
 	}
-	// Use ToSlash for consistent matching across OSes, as glob patterns use '/'
+	// Use ToSlash for consistent matching across OSes
 	pathToCheck := filepath.ToSlash(path)
+	baseName := filepath.Base(pathToCheck)
 
 	for _, pattern := range excludePatterns {
+		// Clean the pattern
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+
+		// Check 1: Match against the full relative path
 		matched, err := filepath.Match(pattern, pathToCheck)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: invalid exclude pattern '%s': %v\n", pattern, err)
+			// Don't spam stderr for every file check if a pattern is bad,
+			// but usually we'd want to warn once. For now, strict match failure is ignored.
 			continue
 		}
 		if matched {
 			return true, pattern
 		}
+
+		// Check 2: Git behavior - if pattern contains no slash (e.g. "*.log" or "node_modules"),
+		// it matches the file/dir name anywhere in the tree.
+		if !strings.Contains(pattern, "/") {
+			matchedBase, _ := filepath.Match(pattern, baseName)
+			if matchedBase {
+				return true, pattern
+			}
+		}
+
+		// Check 3: Handle patterns ending in slash (e.g. "dist/") by matching directory name
+		if strings.HasSuffix(pattern, "/") {
+			cleanPattern := strings.TrimSuffix(pattern, "/")
+			if matched, _ := filepath.Match(cleanPattern, pathToCheck); matched {
+				return true, pattern
+			}
+			if !strings.Contains(cleanPattern, "/") {
+				if matchedBase, _ := filepath.Match(cleanPattern, baseName); matchedBase {
+					return true, pattern
+				}
+			}
+		}
 	}
 	return false, ""
 }
 
+// readGitIgnore looks for a .gitignore file in the given directory and returns its patterns.
+func readGitIgnore(dirPath string) []string {
+	gitIgnorePath := filepath.Join(dirPath, ".gitignore")
+	file, err := os.Open(gitIgnorePath)
+	if err != nil {
+		// If file doesn't exist or can't be opened, just return empty
+		return nil
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// In a real gitignore parser, '!' negates.
+		// For this simple implementation, we assume basic ignores and skip negations to avoid complexity.
+		if strings.HasPrefix(line, "!") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	return patterns
+}
+
 // estimateTokens provides a more detailed heuristic for token counting.
-// It classifies runes and applies different weights.
 func estimateTokens(content string) (int, string) {
 	if content == "" {
 		return 0, ""
@@ -57,16 +116,9 @@ func estimateTokens(content string) (int, string) {
 		}
 	}
 
-	// Heuristics refined based on real-world tokenizer (e.g., LLaMA) feedback.
-	// - Words: ~4 chars per token (standard English approximation). Remains a solid baseline.
 	wordTokens := wordChars / 4
-	// - Whitespace: Tokenizers are very efficient with whitespace (indentation, newlines).
-	//   Using a higher divisor to be more conservative.
 	spaceTokens := spaceChars / 5
-	// - Symbols: Many symbols are combined into single tokens (e.g., '->', ':=', '!=')
-	//   or merged with words. This ratio reflects that not every symbol is a new token.
 	symbolTokens := symbolChars * 2 / 3
-	// - Other: Penalize unknown/multi-byte chars as they likely become multiple tokens.
 	otherTokens := otherChars * 2
 
 	totalEstimate := wordTokens + spaceTokens + symbolTokens + otherTokens
@@ -92,7 +144,6 @@ func estimateTokens(content string) (int, string) {
 
 // getRepoName extracts a readable repository name from a URL to use as the base directory name.
 func getRepoName(url string) string {
-	// Simple heuristic: take the last part of the URL and strip .git
 	parts := strings.Split(strings.TrimRight(url, "/"), "/")
 	if len(parts) == 0 {
 		return "repo"
@@ -120,7 +171,7 @@ func main() {
 	stdoutPtr := flag.Bool("s", false, "Output to stdout instead of clipboard")
 	termCopyPtr := flag.Bool("t", false, "Use terminal-aware clipboard (OSC 52, kitty), ideal for SSH")
 	excludePatternsPtr := flag.String("x", "", "Comma-separated list of glob patterns to exclude (e.g., '.git,*.log,dist/*')")
-	gitRepoPtr := flag.String("g", "", "Git repository URL to clone and process (shallow clone)") // New flag
+	gitRepoPtr := flag.String("g", "", "Git repository URL to clone and process (shallow clone)")
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -146,14 +197,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse exclude patterns
-	var excludePatterns []string
+	// Parse command line exclude patterns
+	var globalExcludePatterns []string
 	if *excludePatternsPtr != "" {
 		patterns := strings.Split(*excludePatternsPtr, ",")
 		for _, p := range patterns {
 			trimmed := strings.TrimSpace(p)
 			if trimmed != "" {
-				excludePatterns = append(excludePatterns, trimmed)
+				globalExcludePatterns = append(globalExcludePatterns, trimmed)
 			}
 		}
 	}
@@ -171,12 +222,10 @@ func main() {
 
 	// Handle Git Repository if -g is provided
 	if *gitRepoPtr != "" {
-		// Check if git is installed
 		if _, err := exec.LookPath("git"); err != nil {
 			log.Fatal("Error: 'git' command not found in PATH. Required for -g flag.")
 		}
 
-		// Create temp directory
 		tempDir, err := os.MkdirTemp("", "fcopy-git-*")
 		if err != nil {
 			log.Fatalf("Error creating temporary directory: %v", err)
@@ -189,7 +238,6 @@ func main() {
 		repoURL := *gitRepoPtr
 		fmt.Fprintf(os.Stderr, "Cloning %s into temporary directory...\n", repoURL)
 
-		// git clone --depth 1 <url> <tempDir>
 		cmd := exec.Command("git", "clone", "--depth", "1", repoURL, tempDir)
 		cmd.Stderr = os.Stderr
 		cmd.Stdout = os.Stderr
@@ -197,8 +245,6 @@ func main() {
 			log.Fatalf("Error cloning repository: %v", err)
 		}
 
-		// Add the temp dir to our targets list.
-		// We set displayBase to the repository name so paths look like "repo/main.go" instead of "/tmp/123/main.go"
 		repoName := getRepoName(repoURL)
 		targetsToProcess = append(targetsToProcess, target{
 			absPath:     tempDir,
@@ -235,19 +281,31 @@ func main() {
 		})
 	}
 
-	// Process all targets (Git repo and/or local paths)
+	// Process all targets
 	for _, t := range targetsToProcess {
-		// Pre-check exclude for the root path itself (mostly for local args)
-		// For git, we usually want to process the root temp dir, but individual files inside will be checked.
-		if !strings.HasPrefix(t.absPath, os.TempDir()) { // Don't exclude the temp dir itself
-			if excluded, pattern := isExcluded(filepath.ToSlash(filepath.Clean(t.displayBase)), excludePatterns); excluded {
+		// Create a specific list of excludes for this target, starting with the globals
+		targetExcludes := make([]string, len(globalExcludePatterns))
+		copy(targetExcludes, globalExcludePatterns)
+
+		// If it's a directory, look for a .gitignore file at the root of that target
+		if t.isDir {
+			gitIgnorePatterns := readGitIgnore(t.absPath)
+			if len(gitIgnorePatterns) > 0 {
+				fmt.Fprintf(os.Stderr, "Detected .gitignore in %s, adding %d patterns.\n", t.displayBase, len(gitIgnorePatterns))
+				targetExcludes = append(targetExcludes, gitIgnorePatterns...)
+			}
+		}
+
+		// Pre-check exclude for the root path itself
+		if !strings.HasPrefix(t.absPath, os.TempDir()) {
+			if excluded, pattern := isExcluded(filepath.ToSlash(filepath.Clean(t.displayBase)), targetExcludes); excluded {
 				fmt.Fprintf(os.Stderr, "Skipping path %s (matches exclude pattern '%s')\n", t.displayBase, pattern)
 				continue
 			}
 		}
 
 		if t.isDir {
-			processDirectory(t.absPath, t.displayBase, &outputBuilder, excludePatterns)
+			processDirectory(t.absPath, t.displayBase, &outputBuilder, targetExcludes)
 		} else {
 			processFile(t.absPath, t.displayBase, &outputBuilder)
 		}
@@ -296,7 +354,6 @@ func main() {
 	if strings.TrimSpace(finalOutput) == "" {
 		fmt.Fprintln(os.Stderr, "Warning: Output is empty or contains only whitespace.")
 	} else {
-		// Calculate and print the elaborated token estimate
 		_, details := estimateTokens(finalOutput)
 		fmt.Fprintf(os.Stderr, "Estimated token count: %s\n", details)
 	}
@@ -313,30 +370,22 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "Content written to file: %s\n", filePath)
 	} else {
-		// Clipboard output (default)
 		copyToClipboard(finalOutput, *termCopyPtr)
 	}
 }
 
 // copyToClipboard handles the logic of copying text to the system clipboard
-// using various methods, prioritizing terminal-friendly ones if requested.
 func copyToClipboard(content string, useTermAware bool) {
 	if strings.TrimSpace(content) == "" {
 		fmt.Fprintln(os.Stderr, "No content to copy to clipboard.")
 		return
 	}
 
-	// Terminal-Aware Copy (OSC 52)
-	// This is the best method for remote sessions with compatible terminals (Kitty, etc.)
 	if useTermAware {
 		term := os.Getenv("TERM")
-		// Check for common terminal types that support OSC 52
 		if strings.Contains(term, "kitty") || strings.Contains(term, "xterm") || os.Getenv("TMUX") != "" {
 			fmt.Fprintln(os.Stderr, "Attempting clipboard copy via OSC 52 escape code...")
 			encodedContent := base64.StdEncoding.EncodeToString([]byte(content))
-			// OSC 52 format: \x1b]52;c;<base64-data>\x07
-			// The 'c' refers to the clipboard selection.
-			// Wrap in DCS for tmux compatibility: \x1bPtmux;\x1b\x1b]52;...
 			if os.Getenv("TMUX") != "" {
 				fmt.Printf("\x1bPtmux;\x1b\x1b]52;c;%s\x07\x1b\\", encodedContent)
 			} else {
@@ -347,10 +396,7 @@ func copyToClipboard(content string, useTermAware bool) {
 		}
 	}
 
-	// Kitty Kitten Clipboard (Very reliable if inside Kitty)
-	// This is a great fallback if OSC 52 is disabled for some reason.
 	if os.Getenv("KITTY_WINDOW_ID") != "" {
-		// First, check if the 'kitty' command is available in the PATH
 		kittyPath, err := exec.LookPath("kitty")
 		if err == nil {
 			fmt.Fprintln(os.Stderr, "Attempting clipboard copy via `kitty +kitten clipboard`...")
@@ -364,8 +410,6 @@ func copyToClipboard(content string, useTermAware bool) {
 		}
 	}
 
-	// External Command-Line Tools
-	// Search for common clipboard utilities.
 	tools := []string{"wl-copy", "xclip -selection clipboard", "xsel --clipboard"}
 	for _, tool := range tools {
 		parts := strings.Fields(tool)
@@ -387,8 +431,6 @@ func copyToClipboard(content string, useTermAware bool) {
 		}
 	}
 
-	// Fallback to Go Library
-	// This often fails over SSH but is a good last resort for local desktop sessions.
 	fmt.Fprintln(os.Stderr, "Falling back to default clipboard library (may not work over SSH)...")
 	if err := clipboard.Init(); err != nil {
 		log.Fatalf("Failed to initialize clipboard library: %v\nPlease install xclip/xsel or wl-clipboard, or use -t.", err)
@@ -409,7 +451,7 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 			return nil
 		}
 
-		// Don't process the root directory entry itself, just continue the walk.
+		// Don't process the root directory entry itself
 		if currentAbsPath == absDirPath {
 			return nil
 		}
@@ -423,7 +465,6 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 
 		// Check against user-defined exclude patterns
 		if excluded, pattern := isExcluded(relativePath, excludePatterns); excluded {
-			// Don't log exclusion of .git folder as it is very common
 			if d.Name() != ".git" {
 				fmt.Fprintf(os.Stderr, "Skipping excluded path: %s (pattern: '%s')\n", relativePath, pattern)
 			}
@@ -436,7 +477,6 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 		// Handle directories (check for hidden ones)
 		if d.IsDir() {
 			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
-				// Don't log exclusion of .git folder
 				if d.Name() != ".git" {
 					fmt.Fprintf(os.Stderr, "Skipping hidden directory: %s\n", relativePath)
 				}
@@ -445,13 +485,12 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 			return nil
 		}
 
-		// Handle files (we are guaranteed it's a file at this point)
+		// Handle files
 		if strings.HasPrefix(d.Name(), ".") {
 			fmt.Fprintf(os.Stderr, "Skipping hidden file: %s\n", relativePath)
 			return nil
 		}
 
-		// Process the file
 		displayFilePath := filepath.ToSlash(filepath.Join(baseDisplayPath, relativePath))
 		processFile(currentAbsPath, displayFilePath, builder)
 		return nil
@@ -500,7 +539,6 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 
 	builder.WriteString(fmt.Sprintf("```%s\n", header))
 	builder.Write(content)
-	// Ensure content ends with a newline before closing backticks if it doesn't already
 	if len(content) > 0 && content[len(content)-1] != '\n' {
 		builder.WriteByte('\n')
 	}
