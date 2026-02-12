@@ -17,6 +17,8 @@ import (
 )
 
 // isExcluded checks if a given path matches any of the glob patterns.
+// Returns true if path matches any pattern, and the matching pattern string.
+// Supports multiple matching strategies for different glob pattern formats.
 func isExcluded(path string, excludePatterns []string) (bool, string) {
 	if len(excludePatterns) == 0 {
 		return false, ""
@@ -69,6 +71,8 @@ func isExcluded(path string, excludePatterns []string) (bool, string) {
 }
 
 // readGitIgnore looks for a .gitignore file in the given directory and returns its patterns.
+// Reads and parses a .gitignore file, returning an array of non-empty, non-comment patterns.
+// Skips negation patterns (!) to keep the implementation simple.
 func readGitIgnore(dirPath string) []string {
 	gitIgnorePath := filepath.Join(dirPath, ".gitignore")
 	file, err := os.Open(gitIgnorePath)
@@ -97,6 +101,8 @@ func readGitIgnore(dirPath string) []string {
 }
 
 // estimateTokens provides a more detailed heuristic for token counting.
+// Breaks down content into characters and applies different conversion factors
+// for words, whitespace, symbols, and other characters to estimate token count.
 func estimateTokens(content string) (int, string) {
 	if content == "" {
 		return 0, ""
@@ -143,6 +149,7 @@ func estimateTokens(content string) (int, string) {
 }
 
 // getRepoName extracts a readable repository name from a URL to use as the base directory name.
+// Cleans the URL by removing trailing slashes and the ".git" suffix to get a clean name.
 func getRepoName(url string) string {
 	parts := strings.Split(strings.TrimRight(url, "/"), "/")
 	if len(parts) == 0 {
@@ -157,12 +164,16 @@ func getRepoName(url string) string {
 }
 
 // target represents a file system location to process
+// Stores absolute path, display-friendly path, and whether it's a directory
 type target struct {
 	absPath     string
 	displayBase string
 	isDir       bool
 }
 
+// main is the entry point of the application.
+// Processes files, directories, or git repositories, formats them as markdown,
+// and outputs to clipboard, stdout, or file based on command-line flags.
 func main() {
 	// Define flags
 	promptPtr := flag.String("p", "", "A prompt to append after the main file contents")
@@ -374,7 +385,9 @@ func main() {
 	}
 }
 
-// copyToClipboard handles the logic of copying text to the system clipboard
+// copyToClipboard handles the logic of copying text to the system clipboard.
+// Implements multiple fallback strategies: terminal-aware clipboard via OSC 52,
+// kitty-specific clipboard, and system clipboard tools (wl-copy, xclip, xsel).
 func copyToClipboard(content string, useTermAware bool) {
 	if strings.TrimSpace(content) == "" {
 		fmt.Fprintln(os.Stderr, "No content to copy to clipboard.")
@@ -440,6 +453,8 @@ func copyToClipboard(content string, useTermAware bool) {
 }
 
 // processDirectory walks a directory and processes all files within it.
+// Recursively visits all files and directories, applying exclude patterns
+// and skipping hidden files/directories (except .git).
 func processDirectory(absDirPath string, baseDisplayPath string, builder *strings.Builder, excludePatterns []string) {
 	fmt.Fprintf(os.Stderr, "Processing directory: %s\n", baseDisplayPath)
 	filepath.WalkDir(absDirPath, func(currentAbsPath string, d fs.DirEntry, errWalk error) error {
@@ -498,6 +513,7 @@ func processDirectory(absDirPath string, baseDisplayPath string, builder *string
 }
 
 // processFile reads a file and appends its content formatted as a markdown code block to the builder.
+// Handles error checking, size limits, binary detection, and adds proper markdown formatting.
 func processFile(absFilePath string, displayFilePath string, builder *strings.Builder) {
 	content, err := os.ReadFile(absFilePath)
 	if err != nil {
@@ -525,7 +541,8 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "Adding file: %s\n", displayFilePath)
+	fileTokens, _ := estimateTokens(string(content))
+	fmt.Fprintf(os.Stderr, "Adding file: %s (~%d tokens)\n", displayFilePath, fileTokens)
 
 	if builder.Len() > 0 {
 		builder.WriteString("\n\n")
@@ -545,7 +562,8 @@ func processFile(absFilePath string, displayFilePath string, builder *strings.Bu
 	builder.WriteString("```\n")
 }
 
-// getLanguageHint determines a language hint from the file extension.
+// getLanguageHint determines a language hint from the file extension or filename.
+// Returns appropriate language identifiers for markdown code blocks based on file extensions.
 func getLanguageHint(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	baseName := strings.ToLower(filepath.Base(filePath))
